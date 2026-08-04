@@ -1,0 +1,6 @@
+build/
+*.o
+*.h264
+*.mp4
+*.png
+playlist.tsv
