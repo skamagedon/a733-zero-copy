@@ -270,6 +270,47 @@ image	slide.png
 video	clip-two.mp4
 ```
 
+### 4. GStreamer element — `cedarzcdec`
+
+If you'd rather not adopt a dedicated player, this is the drop-in: a
+`GstVideoDecoder` that talks to `libvdecoder` and hands downstream real
+`GstDmaBufMemory`. It's what the vendor's `gst-omx` was supposed to be.
+
+```sh
+make gst
+sudo make install-gst
+gst-inspect-1.0 cedarzcdec
+```
+
+Then existing pipelines just work:
+
+```sh
+gst-launch-1.0 filesrc location=clip.mp4 ! qtdemux ! h264parse     ! cedarzcdec ! kmssink driver-name=sunxi-drm
+```
+
+Measured on the same board and clip as the standalone player:
+
+| pipeline | CPU | threads | RSS |
+| --- | --- | --- | --- |
+| `omxh264dec disable-dma-feature=true ! videoconvert ! ximagesink` | 172–182% | 10 | 31.9 MB |
+| `cedarzcdec ! kmssink` | **12–13%** | 4 | 13.0 MB |
+
+It registers at `GST_RANK_PRIMARY + 1`, so `decodebin`/`playbin` pick it ahead
+of `omxh264dec`.
+
+Two implementation notes that may save you time if you write something similar:
+
+- **`alignment=au` is required on the sink pad, not merely preferred.**
+  `libvdecoder` must be handed whole access units; feeding it arbitrary byte
+  runs makes it decode pictures starting mid-slice. Requiring `alignment=au`
+  makes `h264parse` do that framing for you.
+- **Don't force the `memory:DMABuf` caps feature.** `kmssink` (1.18) advertises
+  plain `video/x-raw` and decides whether to import a `dma_buf` by inspecting
+  the buffer's memory at render time. Forcing the feature fails to negotiate
+  with exactly the sinks you want to feed. This element offers the feature,
+  checks whether the peer accepts it, and falls back to plain caps — the
+  buffers are `dma_buf`-backed either way, so nothing is copied.
+
 ### Diagnostics
 
 ```sh

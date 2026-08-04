@@ -8,6 +8,8 @@
 #   make present    reference player for a raw H.264 Annex-B stream
 #   make player     playlist player (MP4 via libavformat, images, hotplug)
 #   make tools      diagnostics: fence capability probe, plane reset
+#   make gst        GStreamer element (libgstcedarzc.so)
+#   make install-gst  install it into the GStreamer plugin dir
 #
 # The playlist player additionally needs libavformat/libavcodec/libswscale.
 
@@ -18,6 +20,11 @@ DRM_LIBS   := $(shell pkg-config --libs libdrm 2>/dev/null || echo -ldrm)
 
 # Vendor Cedar stack, installed by the stock image.
 CEDAR_LIBS := -lvdecoder -lMemAdapter -lVE -lvideoengine -lcdc_base
+
+GST_MODULES := gstreamer-1.0 gstreamer-base-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0
+GST_CFLAGS  := $(shell pkg-config --cflags $(GST_MODULES) 2>/dev/null)
+GST_LIBS    := $(shell pkg-config --libs $(GST_MODULES) 2>/dev/null)
+GST_PLUGINDIR := $(shell pkg-config --variable=pluginsdir gstreamer-1.0 2>/dev/null)
 
 AV_CFLAGS := $(shell pkg-config --cflags libavformat libavcodec libswscale 2>/dev/null)
 AV_LIBS   := $(shell pkg-config --libs libavformat libavcodec libavutil libswscale 2>/dev/null)
@@ -30,7 +37,7 @@ BINS := $(BINDIR)/cedar-dmabuf-drm-probe \
         $(BINDIR)/drm-fence-caps-probe \
         $(BINDIR)/drm-plane-reset
 
-.PHONY: all probe present player tools clean check
+.PHONY: all probe present player tools gst install-gst clean check
 
 all: $(BINS)
 
@@ -38,6 +45,17 @@ probe:   $(BINDIR)/cedar-dmabuf-drm-probe
 present: $(BINDIR)/cedar-drm-present
 player:  $(BINDIR)/zc-playlist-player
 tools:   $(BINDIR)/drm-fence-caps-probe $(BINDIR)/drm-plane-reset
+gst:     $(BINDIR)/libgstcedarzc.so
+
+# Built as a shared object with -fPIC; GStreamer dlopen()s it from the
+# plugin directory.
+$(BINDIR)/libgstcedarzc.so: gst/gstcedarzcdec.c | $(BINDIR)
+	$(CC) $(CFLAGS) -fPIC -shared $(GST_CFLAGS) -o $@ $< $(CEDAR_LIBS) $(GST_LIBS)
+
+install-gst: $(BINDIR)/libgstcedarzc.so
+	@test -n "$(GST_PLUGINDIR)" || { echo "cannot find the GStreamer plugin dir"; exit 1; }
+	install -m 0644 $< $(DESTDIR)$(GST_PLUGINDIR)/libgstcedarzc.so
+	@echo "installed; verify with: gst-inspect-1.0 cedarzcdec"
 
 $(BINDIR):
 	@mkdir -p $(BINDIR)
