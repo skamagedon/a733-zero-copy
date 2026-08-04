@@ -70,7 +70,9 @@ enum entry_kind { ENTRY_VIDEO, ENTRY_IMAGE };
 
 struct entry {
 	enum entry_kind kind;
-	char path[512];
+	/* dir (up to PATH_MAX-ish) + separator + name, so composing the two
+	 * cannot truncate. */
+	char path[1024];
 };
 
 struct fb_entry {
