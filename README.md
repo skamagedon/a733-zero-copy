@@ -182,6 +182,54 @@ completed pictures, so decode completion is already signalled by the call
 returning. The plane does carry `IN_FENCE_FD` if a future decoder ever exposes
 one.
 
+## H.264 encoding: the hardware encoder works, but it is gated and not Annex-B
+
+Two things trip people up here, and neither is a hardware limitation.
+
+**1. The encoder device is root-only.** The decoder node is world-accessible,
+the encoder node is not:
+
+```
+crw-rw-rw-  /dev/cedar_dev       decoder
+crw-------  /dev/cedar_dev_ve2   encoder
+```
+
+As a normal user, `VideoEncCreate()` fails long before any encoding happens:
+
+```
+ve2_env_init: open /dev/cedar_dev_ve2 faild, fd = -1
+VeInitialize:  veEnvInit failed
+VideoEncCreate: init ve ops failed
+```
+
+That is a *different* failure from the reported "wait interrupt overtime" - it
+never reaches the interrupt path. Run as root, or add a udev rule:
+
+```
+SUBSYSTEM=="misc", KERNEL=="cedar_dev_ve2", GROUP="video", MODE="0660"
+```
+
+With the device reachable, encoding runs: 30 frames of 1280x720 encoded in one
+pass, 30 bitstream frames returned, 263 KB out.
+
+**2. The output is AVCC, not Annex-B, and carries no parameter sets.** Setting
+`bEncH264Nalu = 1` does not change this. A raw dump of the encoder output
+starts:
+
+```
+00 00 2c 93   <- 4-byte big-endian NAL length (11411)
+65            <- NAL type 5, an IDR slice
+```
+
+No start codes anywhere, and the stream opens on an IDR with no SPS/PPS - so
+`ffmpeg` rejects it with "No start code is found". To get a playable file:
+
+- fetch SPS/PPS with `VideoEncGetParameter(enc, VENC_IndexParamH264SPSPPS, ...)`
+  into a `VencHeaderData` and write those first, and
+- replace each 4-byte length prefix with `00 00 00 01`.
+
+`tools/cedar-h264-encode-probe.c` does both. Build it with `make tools`.
+
 ## Scope and caveats
 
 - Tested **only** on A733 / `sun60iw2`, Orange Pi 1.0.6 Bullseye, kernel

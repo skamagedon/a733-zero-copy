@@ -48,6 +48,34 @@ static void fill_nv12(unsigned char *y, unsigned char *c, int w, int h,
 		}
 }
 
+/*
+ * The encoder emits AVCC: each NAL prefixed by a 4-byte big-endian length,
+ * with no start codes, and it does NOT include SPS/PPS inline - the first NAL
+ * of the stream is an IDR slice. So a raw dump of the output is not a decodable
+ * .h264 file, which is exactly what ffmpeg reports as "No start code is found".
+ *
+ * Converting to Annex-B means replacing each length prefix with 00 00 00 01,
+ * and writing the SPS/PPS from VENC_IndexParamH264SPSPPS first.
+ */
+static void write_annexb(FILE *f, const unsigned char *data, unsigned int len)
+{
+	static const unsigned char sc[4] = { 0, 0, 0, 1 };
+	unsigned int off = 0;
+
+	while (off + 4 <= len) {
+		unsigned int nal = ((unsigned int)data[off] << 24) |
+				   ((unsigned int)data[off + 1] << 16) |
+				   ((unsigned int)data[off + 2] << 8) |
+				   (unsigned int)data[off + 3];
+		off += 4;
+		if (nal == 0 || off + nal > len)
+			break;
+		fwrite(sc, 1, 4, f);
+		fwrite(data + off, 1, nal, f);
+		off += nal;
+	}
+}
+
 int main(int argc, char **argv)
 {
 	int w      = (argc > 1) ? atoi(argv[1]) : 1280;
@@ -88,7 +116,10 @@ int main(int argc, char **argv)
 	cfg.memops        = memops;
 	cfg.veOpsS        = GetVeOpsS(VE_OPS_TYPE_AW);
 	cfg.pVeOpsSelf    = NULL;
-	cfg.bEncH264Nalu  = 1;				/* Annex-B output */
+	/* Setting this does NOT give Annex-B output on this platform: the encoder
+	 * emits AVCC length-prefixed NALs regardless, which is why write_annexb()
+	 * exists below. Verified by hexdump of the raw output. */
+	cfg.bEncH264Nalu  = 1;
 
 	if (VideoEncInit(enc, &cfg) != 0) {
 		fprintf(stderr, "FAIL: VideoEncInit\n");
@@ -111,6 +142,31 @@ int main(int argc, char **argv)
 		if (!f) {
 			fprintf(stderr, "FAIL: cannot open %s\n", out);
 			goto out;
+		}
+	}
+
+	/* The encoder does not emit SPS/PPS inline - the first NAL of the stream is
+	 * an IDR slice - so they must be fetched and written first, or the file has
+	 * no parameter sets and no decoder can open it. */
+	{
+		VencHeaderData hdr;
+		static const unsigned char sc[4] = { 0, 0, 0, 1 };
+
+		memset(&hdr, 0, sizeof(hdr));
+		if (VideoEncGetParameter(enc, VENC_IndexParamH264SPSPPS, &hdr) == 0 &&
+		    hdr.pBuffer && hdr.nLength) {
+			printf("  SPS/PPS             : %u bytes\n", hdr.nLength);
+			if (f) {
+				int annexb = (hdr.nLength >= 4 && hdr.pBuffer[0] == 0 &&
+					      hdr.pBuffer[1] == 0 && hdr.pBuffer[2] == 0 &&
+					      hdr.pBuffer[3] == 1);
+				if (!annexb)
+					fwrite(sc, 1, 4, f);
+				fwrite(hdr.pBuffer, 1, hdr.nLength, f);
+			}
+		} else {
+			printf("  SPS/PPS             : NOT AVAILABLE"
+			       " - output will not decode\n");
 		}
 	}
 
@@ -153,9 +209,9 @@ int main(int argc, char **argv)
 				total_bytes += ob.nSize0 + ob.nSize1;
 				if (f) {
 					if (ob.nSize0 && ob.pData0)
-						fwrite(ob.pData0, 1, ob.nSize0, f);
+						write_annexb(f, ob.pData0, ob.nSize0);
 					if (ob.nSize1 && ob.pData1)
-						fwrite(ob.pData1, 1, ob.nSize1, f);
+						write_annexb(f, ob.pData1, ob.nSize1);
 				}
 				got++;
 				FreeOneBitStreamFrame(enc, &ob);
