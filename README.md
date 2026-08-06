@@ -245,15 +245,33 @@ the record is fetched after the first frame has been encoded, so it is not
 simply a timing problem. `ffmpeg` therefore reports `non-existing PPS 0
 referenced` and decodes nothing, even though the slice NALs are valid.
 
-`VENC_IndexParamH264SPSPPS` is the only H.264 header index in `vencoder.h`
-(there is no inline-emission option), so on this library build there is no
-obvious second route. If someone knows the right incantation - a required
-`VideoEncSetParameter` first, or caller-supplied storage in `VencHeaderData` -
-that is the missing piece, and the encoder becomes immediately usable.
+What has been ruled out, via `tools/cedar-sps-pps-diag.c`:
 
-So the accurate summary is: **the A733 hardware H.264 encoder runs and produces
-real slice data; it is not "unusable". What is missing is a way to obtain
-usable SPS/PPS, without which the bitstream cannot be decoded.**
+- **Caller-supplied storage.** Passing a poisoned 512-byte buffer in
+  `VencHeaderData.pBuffer` with its capacity in `nLength` returns the same
+  26-byte `0xff` record, so the API is not expecting the caller to provide room.
+- **Extra output pointers.** `VencOutputBuffer.pData1` and `pData2` are empty on
+  every frame; parameter sets are not riding along beside the slice data.
+- **Needing more frames.** The record is byte-identical before encoding and
+  after frames 0, 1 and 2.
+- **A different index.** `VENC_IndexParamH264SPSPPS` is the only H.264 header
+  index in `vencoder.h`; there is no inline-emission option.
+- **`h264_save_sps_pps`.** Despite the name, disassembly shows it `fopen()`s a
+  path - it is a debug dump, not the retrieval path.
+
+Reconstructing the parameter sets externally was also tried: a bit-exact SPS/PPS
+generator was swept across `log2_max_frame_num`, `pic_order_cnt_type`,
+`max_num_ref_frames` and CABAC on/off, constrained to Cedar's own 11-byte SPS
+and 4-byte PPS lengths. Nothing decoded cleanly. The errors do shift with the
+parameters (`illegal reordering_of_pic_nums_idc`, `QP out of range`,
+`cabac_init_idc overflow`), which says the slice headers are being parsed but
+the syntax assumptions are still off somewhere.
+
+One lead remains unexplored: `libvenc_h264.so` contains the log string
+`get sps_pps_data: nLength=%d`, so an internal path does know a real length.
+Raising `venc_log_level` in `/etc/cedarc.conf` should surface it and show
+whether the failure is in generating the parameter sets or only in copying them
+out.
 
 `tools/cedar-h264-encode-probe.c` reproduces all of this. Build with
 `make tools`, run as root.

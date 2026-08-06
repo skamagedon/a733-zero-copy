@@ -44,7 +44,7 @@ all: $(BINS)
 probe:   $(BINDIR)/cedar-dmabuf-drm-probe
 present: $(BINDIR)/cedar-drm-present
 player:  $(BINDIR)/zc-playlist-player
-tools:   $(BINDIR)/drm-fence-caps-probe $(BINDIR)/drm-plane-reset $(BINDIR)/cedar-h264-encode-probe
+tools:   $(BINDIR)/drm-fence-caps-probe $(BINDIR)/drm-plane-reset $(BINDIR)/cedar-h264-encode-probe $(BINDIR)/cedar-sps-pps-diag
 gst:     $(BINDIR)/libgstcedarzc.so
 
 # Built as a shared object with -fPIC; GStreamer dlopen()s it from the
@@ -77,6 +77,9 @@ $(BINDIR)/drm-plane-reset: tools/drm-plane-reset.c | $(BINDIR)
 
 # Encoder probe: needs the venc libraries, not libdrm.
 $(BINDIR)/cedar-h264-encode-probe: tools/cedar-h264-encode-probe.c | $(BINDIR)
+	$(CC) $(CFLAGS) -o $@ $< -lvencoder -lMemAdapter -lVE -lcdc_base
+
+$(BINDIR)/cedar-sps-pps-diag: tools/cedar-sps-pps-diag.c | $(BINDIR)
 	$(CC) $(CFLAGS) -o $@ $< -lvencoder -lMemAdapter -lVE -lcdc_base
 
 # Fail early and legibly if the vendor stack is not what this expects.
