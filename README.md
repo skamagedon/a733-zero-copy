@@ -311,6 +311,42 @@ Two implementation notes that may save you time if you write something similar:
   checks whether the peer accepts it, and falls back to plain caps — the
   buffers are `dma_buf`-backed either way, so nothing is copied.
 
+## Output pixel format: NV12, NV21, YV12 are all selectable
+
+`VConfig.eOutputPixelFormat` is honoured by the decoder, so you are not stuck
+with whatever the examples happen to use. Set it before
+`InitializeVideoDecoder()`:
+
+```c
+vc.eOutputPixelFormat = PIXEL_FORMAT_NV12;   /* 6; NV21 is 5 */
+```
+
+Measured on A733 with an 8-bit H.264 1080p source, requesting each format and
+reporting what `VideoPicture.ePixelFormat` actually came back as:
+
+| requested | delivered | DRM PRIME import |
+| --- | --- | --- |
+| 5 `PIXEL_FORMAT_NV21` | 5 NV21 | works |
+| 6 `PIXEL_FORMAT_NV12` | 6 NV12 | works |
+| 4 `PIXEL_FORMAT_YV12` | 4 YV12 | works |
+| 1 `PIXEL_FORMAT_YUV_PLANER_420` | 1 planar 420 | works |
+| 22 `PIXEL_FORMAT_P010_UV` | 22 reported, but `nBufFd` is 0 | no dma_buf |
+
+So NV12 costs nothing versus NV21 — same stride, same padded height, same
+zero-copy import. Pick whichever your sink prefers rather than converting.
+
+The P010 result needs a caveat: the test source was 8-bit, and a 10-bit output
+from an 8-bit stream is not a meaningful request, so this does **not** show that
+P010 is unsupported in general. It shows only that in that configuration the
+decoder reports the format but hands back no descriptor. Retest with genuine
+10-bit content before concluding anything about HDR/10-bit paths.
+
+Reproduce with the probe, which takes the format as its third argument:
+
+```sh
+./build/cedar-dmabuf-drm-probe clip.h264 /dev/dri/card0 6    # ask for NV12
+```
+
 ### Diagnostics
 
 ```sh

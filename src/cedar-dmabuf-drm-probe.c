@@ -109,6 +109,7 @@ int main(int argc, char **argv)
 {
 	const char *path = (argc > 1) ? argv[1] : NULL;
 	const char *card = (argc > 2) ? argv[2] : "/dev/dri/card0";
+	int req_fmt = (argc > 3) ? atoi(argv[3]) : PIXEL_FORMAT_NV21;
 	struct ScMemOpsS *memops = NULL;
 	VideoDecoder *dec = NULL;
 	VideoStreamInfo si;
@@ -124,7 +125,7 @@ int main(int argc, char **argv)
 	char linkbuf[256];
 
 	if (!path) {
-		fprintf(stderr, "usage: %s <file.h264> [drm-card]\n", argv[0]);
+		fprintf(stderr, "usage: %s <file.h264> [drm-card] [pixel-format]\n", argv[0]);
 		return 1;
 	}
 
@@ -173,9 +174,14 @@ int main(int argc, char **argv)
 	vc.memops = memops;
 	vc.veOpsS = GetVeOpsS(VE_OPS_TYPE_AW);
 	vc.pVeOpsSelf = NULL;
-	/* Ask for a linear semi-planar surface a DRM plane can scan out. If the
-	 * decoder overrides this the actual value is reported below. */
-	vc.eOutputPixelFormat = PIXEL_FORMAT_NV21;
+	/* Ask for a linear semi-planar surface a DRM plane can scan out. The
+	 * requested value is only a request: the decoder may override it, which is
+	 * why the value actually delivered is reported below rather than assumed.
+	 * Override with argv[3] to test whether a given format is honoured
+	 * (5 = NV21, 6 = NV12, 4 = YV12, 22 = P010_UV). */
+	vc.eOutputPixelFormat = req_fmt;
+	printf("requested eOutputPixelFormat: %d (%s)\n", req_fmt,
+	       pixfmt_name(req_fmt));
 	vc.nFrameBufferNum = 6;
 	vc.bDispErrorFrame = 1;
 	vc.bSupportPallocBufBeforeDecode = 1;
