@@ -212,23 +212,51 @@ SUBSYSTEM=="misc", KERNEL=="cedar_dev_ve2", GROUP="video", MODE="0660"
 With the device reachable, encoding runs: 30 frames of 1280x720 encoded in one
 pass, 30 bitstream frames returned, 263 KB out.
 
-**2. The output is AVCC, not Annex-B, and carries no parameter sets.** Setting
-`bEncH264Nalu = 1` does not change this. A raw dump of the encoder output
-starts:
+**2. The output is AVCC, not Annex-B.** Setting `bEncH264Nalu = 1` does not
+change this. A raw dump of the encoder output starts:
 
 ```
 00 00 2c 93   <- 4-byte big-endian NAL length (11411)
 65            <- NAL type 5, an IDR slice
 ```
 
-No start codes anywhere, and the stream opens on an IDR with no SPS/PPS - so
-`ffmpeg` rejects it with "No start code is found". To get a playable file:
+No start codes anywhere. Converting is simple: replace each 4-byte length
+prefix with `00 00 00 01`. The slice data itself is genuine - after conversion
+you get a correct IDR followed by P slices of plausible sizes.
 
-- fetch SPS/PPS with `VideoEncGetParameter(enc, VENC_IndexParamH264SPSPPS, ...)`
-  into a `VencHeaderData` and write those first, and
-- replace each 4-byte length prefix with `00 00 00 01`.
+**3. Parameter sets could not be retrieved, so the output does not yet decode.**
+This is the open problem, and it is worth being precise about because a byte
+count alone looks like success.
 
-`tools/cedar-h264-encode-probe.c` does both. Build it with `make tools`.
+`VideoEncGetParameter(enc, VENC_IndexParamH264SPSPPS, &hdr)` returns 26 bytes
+that are a *correctly shaped* avcC `AVCDecoderConfigurationRecord`:
+
+```
+01 64 00 33 ff  01 00 0b [11 bytes]  01 00 04 [4 bytes]
+│  │     │      │  └ SPS length 11   └ 1 PPS, length 4
+│  │     └ level 5.1
+│  └ High profile
+└ configurationVersion
+```
+
+Profile, level, `lengthSizeMinusOne` and both parameter-set *lengths* are all
+plausible - but both *payloads* are `ff ff ff …` filler. That is still true when
+the record is fetched after the first frame has been encoded, so it is not
+simply a timing problem. `ffmpeg` therefore reports `non-existing PPS 0
+referenced` and decodes nothing, even though the slice NALs are valid.
+
+`VENC_IndexParamH264SPSPPS` is the only H.264 header index in `vencoder.h`
+(there is no inline-emission option), so on this library build there is no
+obvious second route. If someone knows the right incantation - a required
+`VideoEncSetParameter` first, or caller-supplied storage in `VencHeaderData` -
+that is the missing piece, and the encoder becomes immediately usable.
+
+So the accurate summary is: **the A733 hardware H.264 encoder runs and produces
+real slice data; it is not "unusable". What is missing is a way to obtain
+usable SPS/PPS, without which the bitstream cannot be decoded.**
+
+`tools/cedar-h264-encode-probe.c` reproduces all of this. Build with
+`make tools`, run as root.
 
 ## Scope and caveats
 

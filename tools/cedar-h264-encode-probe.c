@@ -57,6 +57,58 @@ static void fill_nv12(unsigned char *y, unsigned char *c, int w, int h,
  * Converting to Annex-B means replacing each length prefix with 00 00 00 01,
  * and writing the SPS/PPS from VENC_IndexParamH264SPSPPS first.
  */
+/*
+ * VENC_IndexParamH264SPSPPS returns an avcC AVCDecoderConfigurationRecord, not
+ * raw NALs:
+ *
+ *   01 <profile> <compat> <level> ff  01 <spsLen:2> <SPS...>  01 <ppsLen:2> <PPS...>
+ *
+ * Writing that block verbatim behind one start code produces exactly the
+ * "pps_id out of range" / "non-existing PPS" errors ffmpeg reports, because the
+ * whole record gets parsed as a single malformed NAL. Each parameter set has to
+ * be emitted as its own Annex-B NAL instead.
+ *
+ * It must also be fetched AFTER the first frame is encoded. Queried before
+ * that, the record is well-formed but both payloads are 0xff filler.
+ */
+static int write_avcc_header(FILE *f, const unsigned char *d, unsigned int len)
+{
+	static const unsigned char sc[4] = { 0, 0, 0, 1 };
+	unsigned int off = 5;		/* skip version/profile/compat/level/flags */
+	unsigned int i, count;
+	int written = 0;
+
+	if (len < 7 || d[0] != 1)
+		return 0;
+
+	count = d[off++] & 0x1f;	/* number of SPS */
+	for (i = 0; i < count && off + 2 <= len; i++) {
+		unsigned int n = ((unsigned int)d[off] << 8) | d[off + 1];
+		off += 2;
+		if (off + n > len)
+			return written;
+		fwrite(sc, 1, 4, f);
+		fwrite(d + off, 1, n, f);
+		off += n;
+		written++;
+	}
+
+	if (off >= len)
+		return written;
+	count = d[off++];		/* number of PPS */
+	for (i = 0; i < count && off + 2 <= len; i++) {
+		unsigned int n = ((unsigned int)d[off] << 8) | d[off + 1];
+		off += 2;
+		if (off + n > len)
+			return written;
+		fwrite(sc, 1, 4, f);
+		fwrite(d + off, 1, n, f);
+		off += n;
+		written++;
+	}
+	return written;
+}
+
 static void write_annexb(FILE *f, const unsigned char *data, unsigned int len)
 {
 	static const unsigned char sc[4] = { 0, 0, 0, 1 };
@@ -145,31 +197,6 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* The encoder does not emit SPS/PPS inline - the first NAL of the stream is
-	 * an IDR slice - so they must be fetched and written first, or the file has
-	 * no parameter sets and no decoder can open it. */
-	{
-		VencHeaderData hdr;
-		static const unsigned char sc[4] = { 0, 0, 0, 1 };
-
-		memset(&hdr, 0, sizeof(hdr));
-		if (VideoEncGetParameter(enc, VENC_IndexParamH264SPSPPS, &hdr) == 0 &&
-		    hdr.pBuffer && hdr.nLength) {
-			printf("  SPS/PPS             : %u bytes\n", hdr.nLength);
-			if (f) {
-				int annexb = (hdr.nLength >= 4 && hdr.pBuffer[0] == 0 &&
-					      hdr.pBuffer[1] == 0 && hdr.pBuffer[2] == 0 &&
-					      hdr.pBuffer[3] == 1);
-				if (!annexb)
-					fwrite(sc, 1, 4, f);
-				fwrite(hdr.pBuffer, 1, hdr.nLength, f);
-			}
-		} else {
-			printf("  SPS/PPS             : NOT AVAILABLE"
-			       " - output will not decode\n");
-		}
-	}
-
 	for (int n = 0; n < frames; n++) {
 		VencInputBuffer in;
 		VencOutputBuffer ob;
@@ -202,6 +229,29 @@ int main(int argc, char **argv)
 
 		AlreadyUsedInputBuffer(enc, &in);
 		ReturnOneAllocInputBuffer(enc, &in);
+
+		/* Fetch the parameter sets once the encoder has actually produced a
+		 * frame - before that the record contains only 0xff filler - and
+		 * write them ahead of any slice data. */
+		if (n == 0 && f) {
+			VencHeaderData hdr;
+
+			memset(&hdr, 0, sizeof(hdr));
+			if (VideoEncGetParameter(enc, VENC_IndexParamH264SPSPPS,
+						 &hdr) == 0 && hdr.pBuffer && hdr.nLength) {
+				int nals = write_avcc_header(f, hdr.pBuffer, hdr.nLength);
+
+				printf("  SPS/PPS             : %u bytes, %d NAL(s) written\n",
+				       hdr.nLength, nals);
+				if (nals == 0)
+					fprintf(stderr,
+						"WARN: parameter sets could not be parsed;"
+						" output will not decode\n");
+			} else {
+				fprintf(stderr,
+					"WARN: no SPS/PPS available; output will not decode\n");
+			}
+		}
 
 		if (ValidBitstreamFrameNum(enc) > 0) {
 			memset(&ob, 0, sizeof(ob));
