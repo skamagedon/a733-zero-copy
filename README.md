@@ -298,6 +298,20 @@ Measured on the same board and clip as the standalone player:
 It registers at `GST_RANK_PRIMARY + 1`, so `decodebin`/`playbin` pick it ahead
 of `omxh264dec`.
 
+The output format is negotiated, not hardcoded: the element advertises both
+NV12 and NV21, asks downstream which it wants, and configures the decoder
+accordingly. NV12 is preferred when the peer accepts either, since it is the
+more widely expected format and costs exactly the same here. Forcing either
+works:
+
+```sh
+... ! cedarzcdec ! "video/x-raw(memory:DMABuf),format=NV21" ! fakesink
+... ! cedarzcdec ! "video/x-raw(memory:DMABuf),format=NV12" ! fakesink
+```
+
+The format the decoder actually delivers is treated as authoritative, so a
+silent override would surface as a caps mismatch rather than as wrong colours.
+
 Two implementation notes that may save you time if you write something similar:
 
 - **`alignment=au` is required on the sink pad, not merely preferred.**

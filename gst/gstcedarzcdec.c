@@ -18,6 +18,11 @@
  *
  * No CPU pixel copy occurs anywhere in this element.
  *
+ * Output format is negotiated rather than hardcoded. Cedar honours a request
+ * for NV12 or NV21 identically - same stride, same padded height, same
+ * zero-copy import - so the element asks downstream which it wants and
+ * configures the decoder accordingly, preferring NV12 when both are accepted.
+ *
  * Buffer lifetime is the subtle part. Cedar owns a small pool of surfaces and
  * recycles them, so a picture must not be returned while downstream still holds
  * it. Each output buffer therefore carries a weak reference: when GStreamer
@@ -71,6 +76,13 @@ struct _GstCedarZcDec
 
   gboolean configured;
   gint width, height;           /* display size, after crop */
+
+  /* Output format chosen at set_format time and confirmed against what the
+   * decoder actually delivers. Cedar honours the request for NV12, NV21 and
+   * YV12 alike - same stride, same padded height, same zero-copy import - so
+   * the choice is downstream's to make, not ours to hardcode. */
+  int cedar_format;                 /* PIXEL_FORMAT_* handed to VConfig */
+  GstVideoFormat gst_format;        /* matching GStreamer format */
 };
 
 G_DEFINE_TYPE (GstCedarZcDec, gst_cedar_zc_dec, GST_TYPE_VIDEO_DECODER);
@@ -89,8 +101,77 @@ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC, GST_PAD_ALWAYS,
     GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
-        (GST_CAPS_FEATURE_MEMORY_DMABUF, "NV21") "; "
-        GST_VIDEO_CAPS_MAKE ("NV21")));
+        (GST_CAPS_FEATURE_MEMORY_DMABUF, "{ NV12, NV21 }") "; "
+        GST_VIDEO_CAPS_MAKE ("{ NV12, NV21 }")));
+
+/* ----------------------------------------------------------------- format */
+
+static int
+gst_to_cedar_format (GstVideoFormat f)
+{
+  switch (f) {
+    case GST_VIDEO_FORMAT_NV12: return PIXEL_FORMAT_NV12;
+    case GST_VIDEO_FORMAT_NV21: return PIXEL_FORMAT_NV21;
+    default:                    return -1;
+  }
+}
+
+static GstVideoFormat
+cedar_to_gst_format (int f)
+{
+  switch (f) {
+    case PIXEL_FORMAT_NV12: return GST_VIDEO_FORMAT_NV12;
+    case PIXEL_FORMAT_NV21: return GST_VIDEO_FORMAT_NV21;
+    default:                return GST_VIDEO_FORMAT_UNKNOWN;
+  }
+}
+
+/* Ask downstream which of our formats it wants, before the decoder is created,
+ * because eOutputPixelFormat has to be set at InitializeVideoDecoder time.
+ *
+ * NV12 is preferred when the peer accepts both: it is the more widely expected
+ * format, and on this hardware it costs exactly the same as NV21. NV21 remains
+ * the fallback because it is the combination this element was first proven
+ * against. */
+static GstVideoFormat
+preferred_downstream_format (GstCedarZcDec * self)
+{
+  GstPad *srcpad = GST_VIDEO_DECODER_SRC_PAD (GST_VIDEO_DECODER (self));
+  const GstVideoFormat order[] = { GST_VIDEO_FORMAT_NV12, GST_VIDEO_FORMAT_NV21 };
+  GstCaps *peer;
+  guint i;
+
+  peer = gst_pad_peer_query_caps (srcpad, NULL);
+  if (!peer || gst_caps_is_any (peer) || gst_caps_is_empty (peer)) {
+    if (peer)
+      gst_caps_unref (peer);
+    return GST_VIDEO_FORMAT_NV12;
+  }
+
+  for (i = 0; i < G_N_ELEMENTS (order); i++) {
+    const gchar *name = gst_video_format_to_string (order[i]);
+    GstCaps *probe = gst_caps_new_simple ("video/x-raw",
+        "format", G_TYPE_STRING, name, NULL);
+    gboolean ok = gst_caps_can_intersect (peer, probe);
+
+    if (!ok) {
+      /* Try again carrying the DMABuf feature, since a sink may only list its
+       * formats under that feature. */
+      gst_caps_set_features (probe, 0,
+          gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_DMABUF, NULL));
+      ok = gst_caps_can_intersect (peer, probe);
+    }
+    gst_caps_unref (probe);
+
+    if (ok) {
+      gst_caps_unref (peer);
+      return order[i];
+    }
+  }
+
+  gst_caps_unref (peer);
+  return GST_VIDEO_FORMAT_NV12;
+}
 
 /* ---------------------------------------------------------------- release */
 
@@ -215,7 +296,13 @@ gst_cedar_zc_dec_set_format (GstVideoDecoder * decoder,
   memset (&vc, 0, sizeof (vc));
   vc.memops = self->memops;
   vc.veOpsS = GetVeOpsS (VE_OPS_TYPE_AW);
-  vc.eOutputPixelFormat = PIXEL_FORMAT_NV21;
+  self->gst_format = preferred_downstream_format (self);
+  self->cedar_format = gst_to_cedar_format (self->gst_format);
+  if (self->cedar_format < 0) {
+    self->gst_format = GST_VIDEO_FORMAT_NV12;
+    self->cedar_format = PIXEL_FORMAT_NV12;
+  }
+  vc.eOutputPixelFormat = self->cedar_format;
   vc.nFrameBufferNum = 8;
   vc.bDispErrorFrame = 1;
   vc.nDisplayHoldingFrameBufferNum = 2;
@@ -230,7 +317,8 @@ gst_cedar_zc_dec_set_format (GstVideoDecoder * decoder,
   g_mutex_unlock (&self->lock);
 
   self->configured = FALSE;     /* output state set once we see a picture */
-  GST_INFO_OBJECT (self, "decoder configured for H.264");
+  GST_INFO_OBJECT (self, "decoder configured for H.264, requesting %s output",
+      gst_video_format_to_string (self->gst_format));
   return TRUE;
 }
 
@@ -242,12 +330,30 @@ configure_output (GstCedarZcDec * self, VideoPicture * pic)
 {
   GstVideoDecoder *decoder = GST_VIDEO_DECODER (self);
   GstVideoCodecState *out;
+  GstVideoFormat delivered;
   gint w, h;
 
   w = pic->nRightOffset ? pic->nRightOffset - pic->nLeftOffset : pic->nWidth;
   h = pic->nBottomOffset ? pic->nBottomOffset - pic->nTopOffset : pic->nHeight;
 
-  out = gst_video_decoder_set_output_state (decoder, GST_VIDEO_FORMAT_NV21,
+  /* The delivered format is authoritative. We ask for one, and the decoder has
+   * honoured that on this hardware, but reporting what actually arrived means a
+   * silent override shows up as a caps mismatch rather than as wrong colours. */
+  delivered = cedar_to_gst_format (pic->ePixelFormat);
+  if (delivered == GST_VIDEO_FORMAT_UNKNOWN) {
+    GST_ERROR_OBJECT (self,
+        "decoder delivered ePixelFormat %d, which this element cannot map",
+        pic->ePixelFormat);
+    return FALSE;
+  }
+  if (delivered != self->gst_format) {
+    GST_WARNING_OBJECT (self, "asked for %s but the decoder delivered %s",
+        gst_video_format_to_string (self->gst_format),
+        gst_video_format_to_string (delivered));
+    self->gst_format = delivered;
+  }
+
+  out = gst_video_decoder_set_output_state (decoder, delivered,
       w, h, self->input_state);
   if (!out)
     return FALSE;
@@ -295,8 +401,9 @@ configure_output (GstCedarZcDec * self, VideoPicture * pic)
   self->width = w;
   self->height = h;
   self->configured = TRUE;
-  GST_INFO_OBJECT (self, "output %dx%d NV21 (buffer %dx%d, stride %d)",
-      w, h, pic->nWidth, pic->nHeight, pic->nLineStride);
+  GST_INFO_OBJECT (self, "output %dx%d %s (buffer %dx%d, stride %d)",
+      w, h, gst_video_format_to_string (delivered),
+      pic->nWidth, pic->nHeight, pic->nLineStride);
   return TRUE;
 }
 
@@ -340,7 +447,7 @@ wrap_picture (GstCedarZcDec * self, VideoPicture * pic)
   offsets[1] = (gsize) (pic->pData1 - pic->pData0);
 
   gst_buffer_add_video_meta_full (buf, GST_VIDEO_FRAME_FLAG_NONE,
-      GST_VIDEO_FORMAT_NV21, self->width, self->height, 2, offsets, strides);
+      self->gst_format, self->width, self->height, 2, offsets, strides);
 
   /* Hand the surface back only when downstream is finished with it. */
   fr = g_new0 (FrameRelease, 1);
