@@ -68,18 +68,209 @@ static void fill_nv12(unsigned char *y, unsigned char *c, int w, int h,
  * whole record gets parsed as a single malformed NAL. Each parameter set has to
  * be emitted as its own Annex-B NAL instead.
  *
- * It must also be fetched AFTER the first frame is encoded. Queried before
- * that, the record is well-formed but both payloads are 0xff filler.
+ * On A733 that is not enough, because the SPS and PPS payloads inside the
+ * record are 0xff filler at every point in the encoder's life: before the first
+ * frame, after one frame, and after many. Setting venc_log_level = 0 in
+ * /etc/cedarc.conf (the log emits "from /vendor/etc/cedarc.conf", but that path
+ * does not exist - /etc/cedarc.conf is the file actually read) shows the
+ * library's internal "get sps_pps_data" path never executes at all. The record
+ * is a stub, not a failed copy, so there is nothing to retrieve.
+ *
+ * The parameter sets are still recoverable, because the encoder writes slice
+ * headers that are self-consistent with exactly one set of values. Parsing 30
+ * consecutive slice headers pins them:
+ *
+ *   frame_num reads 0,1,2,...      only under log2_max_frame_num = 12
+ *   pic_order_cnt_lsb steps by 2   only under log2_max_poc_lsb   = 12
+ *   cabac_init_idc present, valid  -> entropy_coding_mode_flag   = 1
+ *   slice_qp_delta ramps +4..-8    -> pic_init_qp_minus26        = 0
+ *
+ * The smooth rate-control ramp in that last one is what confirms the bit
+ * alignment is genuinely right: a wrong offset yields noise, not a monotone
+ * curve. The record's own header bytes ARE valid, so profile, level and the two
+ * lengths come from it; the values below reproduce those lengths exactly (11
+ * and 4 bytes), and the result decodes every frame with no errors at ~46 dB
+ * PSNR against the encoder's source pattern.
+ *
+ * max_num_ref_frames cannot be recovered from the stream - it only ever uses
+ * one reference, so 1 and 2 are indistinguishable. 2 is used here because it is
+ * the safer DPB hint and still matches the declared length.
  */
-static int write_avcc_header(FILE *f, const unsigned char *d, unsigned int len)
+struct bw { unsigned char b[64]; int n; };
+
+static void bw_u(struct bw *s, int n, unsigned int v)
+{
+	int i;
+
+	for (i = n - 1; i >= 0; i--) {
+		if ((v >> i) & 1)
+			s->b[s->n >> 3] |= 0x80 >> (s->n & 7);
+		s->n++;
+	}
+}
+
+static void bw_ue(struct bw *s, unsigned int v)
+{
+	unsigned int t = ++v;
+	int n = 0;
+
+	while (t >>= 1)
+		n++;
+	bw_u(s, n, 0);
+	bw_u(s, n + 1, v);
+}
+
+static void bw_se(struct bw *s, int v)
+{
+	bw_ue(s, v > 0 ? (unsigned int)(2 * v - 1) : (unsigned int)(-2 * v));
+}
+
+static int bw_finish(struct bw *s)		/* rbsp_trailing_bits; -> bytes */
+{
+	bw_u(s, 1, 1);
+	while (s->n & 7)
+		bw_u(s, 1, 0);
+	return s->n >> 3;
+}
+
+static int build_sps(struct bw *s, int w, int h, int profile, int level)
+{
+	int mbw = (w + 15) / 16, mbh = (h + 15) / 16;
+	int cropr = (mbw * 16 - w) / 2;	/* CropUnitX = 2 for 4:2:0 */
+	int cropb = (mbh * 16 - h) / 2;	/* CropUnitY = 2 when frame_mbs_only */
+
+	memset(s, 0, sizeof(*s));
+	bw_u(s, 8, 0x67);
+	bw_u(s, 8, (unsigned int)profile);
+	bw_u(s, 8, 0);
+	bw_u(s, 8, (unsigned int)level);
+	bw_ue(s, 0);			/* seq_parameter_set_id */
+	bw_ue(s, 1);			/* chroma_format_idc: 4:2:0 */
+	bw_ue(s, 0);			/* bit_depth_luma_minus8 */
+	bw_ue(s, 0);			/* bit_depth_chroma_minus8 */
+	bw_u(s, 1, 0);			/* qpprime_y_zero_transform_bypass */
+	bw_u(s, 1, 0);			/* seq_scaling_matrix_present */
+	bw_ue(s, 8);			/* log2_max_frame_num_minus4 -> 12 */
+	bw_ue(s, 0);			/* pic_order_cnt_type */
+	bw_ue(s, 8);			/* log2_max_poc_lsb_minus4   -> 12 */
+	bw_ue(s, 2);			/* max_num_ref_frames */
+	bw_u(s, 1, 1);			/* gaps_in_frame_num_value_allowed */
+	bw_ue(s, (unsigned int)(mbw - 1));
+	bw_ue(s, (unsigned int)(mbh - 1));
+	bw_u(s, 1, 1);			/* frame_mbs_only_flag */
+	bw_u(s, 1, 1);			/* direct_8x8_inference_flag */
+	bw_u(s, 1, (cropr || cropb) ? 1 : 0);
+	if (cropr || cropb) {
+		bw_ue(s, 0);		/* crop left */
+		bw_ue(s, (unsigned int)cropr);
+		bw_ue(s, 0);		/* crop top */
+		bw_ue(s, (unsigned int)cropb);
+	}
+	bw_u(s, 1, 0);			/* vui_parameters_present_flag */
+	return bw_finish(s);
+}
+
+static int build_pps(struct bw *s)
+{
+	memset(s, 0, sizeof(*s));
+	bw_u(s, 8, 0x68);
+	bw_ue(s, 0);			/* pic_parameter_set_id */
+	bw_ue(s, 0);			/* seq_parameter_set_id */
+	bw_u(s, 1, 1);			/* entropy_coding_mode_flag: CABAC */
+	bw_u(s, 1, 0);			/* bottom_field_pic_order_present */
+	bw_ue(s, 0);			/* num_slice_groups_minus1 */
+	bw_ue(s, 0);			/* num_ref_idx_l0_default_active_minus1 */
+	bw_ue(s, 0);			/* num_ref_idx_l1_default_active_minus1 */
+	bw_u(s, 1, 0);			/* weighted_pred_flag */
+	bw_u(s, 2, 0);			/* weighted_bipred_idc */
+	bw_se(s, 0);			/* pic_init_qp_minus26 */
+	bw_se(s, 0);			/* pic_init_qs_minus26 */
+	bw_se(s, 0);			/* chroma_qp_index_offset */
+	bw_u(s, 1, 1);			/* deblocking_filter_control_present */
+	bw_u(s, 1, 0);			/* constrained_intra_pred_flag */
+	bw_u(s, 1, 0);			/* redundant_pic_cnt_present_flag */
+	return bw_finish(s);
+}
+
+/* True when the record is absent, malformed, or shaped correctly but carrying
+ * only 0xff filler payloads - the A733 case.
+ *
+ * This has to walk the record rather than scan it. The length fields are real
+ * data (00 0b, 00 04), so a flat "is every byte 0xff?" test reports a genuine
+ * record and silently takes the parse path. Only the SPS and PPS payloads are
+ * filler, and only they may be examined. */
+static int avcc_is_filler(const unsigned char *d, unsigned int len)
+{
+	unsigned int off = 5, i, k, count;
+
+	if (len < 7 || d[0] != 1)
+		return 1;
+
+	count = d[off++] & 0x1f;		/* number of SPS */
+	for (i = 0; i < count; i++) {
+		unsigned int n;
+
+		if (off + 2 > len)
+			return 1;
+		n = ((unsigned int)d[off] << 8) | d[off + 1];
+		off += 2;
+		if (n == 0 || off + n > len)
+			return 1;
+		for (k = 0; k < n; k++)
+			if (d[off + k] != 0xff)
+				return 0;	/* a real parameter set */
+		off += n;
+	}
+
+	if (off >= len)
+		return 1;
+	count = d[off++];			/* number of PPS */
+	for (i = 0; i < count; i++) {
+		unsigned int n;
+
+		if (off + 2 > len)
+			return 1;
+		n = ((unsigned int)d[off] << 8) | d[off + 1];
+		off += 2;
+		if (n == 0 || off + n > len)
+			return 1;
+		for (k = 0; k < n; k++)
+			if (d[off + k] != 0xff)
+				return 0;
+		off += n;
+	}
+	return 1;
+}
+
+static int write_avcc_header(FILE *f, const unsigned char *d, unsigned int len,
+			     int w, int h)
 {
 	static const unsigned char sc[4] = { 0, 0, 0, 1 };
 	unsigned int off = 5;		/* skip version/profile/compat/level/flags */
 	unsigned int i, count;
 	int written = 0;
 
-	if (len < 7 || d[0] != 1)
-		return 0;
+	if (avcc_is_filler(d, len)) {
+		int profile = (len >= 4) ? d[1] : 100;
+		int level   = (len >= 4) ? d[3] : 51;
+		struct bw s;
+		int n;
+
+		n = build_sps(&s, w, h, profile, level);
+		fwrite(sc, 1, 4, f);
+		fwrite(s.b, 1, (size_t)n, f);
+		written++;
+
+		n = build_pps(&s);
+		fwrite(sc, 1, 4, f);
+		fwrite(s.b, 1, (size_t)n, f);
+		written++;
+
+		fprintf(stderr,
+			"note: parameter sets are 0xff filler; synthesized them"
+			" from profile %d level %d\n", profile, level);
+		return written;
+	}
 
 	count = d[off++] & 0x1f;	/* number of SPS */
 	for (i = 0; i < count && off + 2 <= len; i++) {
@@ -230,16 +421,17 @@ int main(int argc, char **argv)
 		AlreadyUsedInputBuffer(enc, &in);
 		ReturnOneAllocInputBuffer(enc, &in);
 
-		/* Fetch the parameter sets once the encoder has actually produced a
-		 * frame - before that the record contains only 0xff filler - and
-		 * write them ahead of any slice data. */
+		/* Write the parameter sets ahead of any slice data. The record
+		 * itself is filler on this platform, so write_avcc_header()
+		 * synthesizes them; see the comment above it. */
 		if (n == 0 && f) {
 			VencHeaderData hdr;
 
 			memset(&hdr, 0, sizeof(hdr));
 			if (VideoEncGetParameter(enc, VENC_IndexParamH264SPSPPS,
 						 &hdr) == 0 && hdr.pBuffer && hdr.nLength) {
-				int nals = write_avcc_header(f, hdr.pBuffer, hdr.nLength);
+				int nals = write_avcc_header(f, hdr.pBuffer,
+							     hdr.nLength, w, h);
 
 				printf("  SPS/PPS             : %u bytes, %d NAL(s) written\n",
 				       hdr.nLength, nals);

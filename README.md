@@ -182,9 +182,9 @@ completed pictures, so decode completion is already signalled by the call
 returning. The plane does carry `IN_FENCE_FD` if a future decoder ever exposes
 one.
 
-## H.264 encoding: the hardware encoder works, but it is gated and not Annex-B
+## H.264 encoding: the hardware encoder works, and its output can be made to decode
 
-Two things trip people up here, and neither is a hardware limitation.
+Three things trip people up here, and none of them is a hardware limitation.
 
 **1. The encoder device is root-only.** The decoder node is world-accessible,
 the encoder node is not:
@@ -224,9 +224,9 @@ No start codes anywhere. Converting is simple: replace each 4-byte length
 prefix with `00 00 00 01`. The slice data itself is genuine - after conversion
 you get a correct IDR followed by P slices of plausible sizes.
 
-**3. Parameter sets could not be retrieved, so the output does not yet decode.**
-This is the open problem, and it is worth being precise about because a byte
-count alone looks like success.
+**3. The parameter sets cannot be retrieved at all — they have to be
+synthesized.** This is the part that actually blocks decoding, and it is worth
+being precise about, because a byte count alone looks like success.
 
 `VideoEncGetParameter(enc, VENC_IndexParamH264SPSPPS, &hdr)` returns 26 bytes
 that are a *correctly shaped* avcC `AVCDecoderConfigurationRecord`:
@@ -259,22 +259,69 @@ What has been ruled out, via `tools/cedar-sps-pps-diag.c`:
 - **`h264_save_sps_pps`.** Despite the name, disassembly shows it `fopen()`s a
   path - it is a debug dump, not the retrieval path.
 
-Reconstructing the parameter sets externally was also tried: a bit-exact SPS/PPS
-generator was swept across `log2_max_frame_num`, `pic_order_cnt_type`,
-`max_num_ref_frames` and CABAC on/off, constrained to Cedar's own 11-byte SPS
-and 4-byte PPS lengths. Nothing decoded cleanly. The errors do shift with the
-parameters (`illegal reordering_of_pic_nums_idc`, `QP out of range`,
-`cabac_init_idc overflow`), which says the slice headers are being parsed but
-the syntax assumptions are still off somewhere.
+And finally, **the record is a stub, not a failed copy.** `libvenc_h264.so`
+contains the log string `get sps_pps_data: nLength=%d`, which looked like
+evidence that an internal path knew a real length. It does not run. Setting
+`venc_log_level = 0` in `/etc/cedarc.conf` and re-running never prints that
+line, so nothing is generating the parameter sets in the first place. There is
+nothing to retrieve, and no further point poking at the API.
 
-One lead remains unexplored: `libvenc_h264.so` contains the log string
-`get sps_pps_data: nLength=%d`, so an internal path does know a real length.
-Raising `venc_log_level` in `/etc/cedarc.conf` should surface it and show
-whether the failure is in generating the parameter sets or only in copying them
-out.
+A logging detail worth knowing while you test this: the runtime prints
+`Set log level to 5 from /vendor/etc/cedarc.conf`, but **`/vendor` does not
+exist on this image**. The file actually read is `/etc/cedarc.conf` — the line
+immediately above it, `load conf file /etc/cedarc.conf ok!`, is the truthful
+one. The path in that message is a hardcoded string. There is no `getenv` in
+`libcdc_base.so`, so the level cannot be set from the environment, and the file
+semantics are *"log will output if level >= log_level"* — **lower** the number
+to see **more**.
 
-`tools/cedar-h264-encode-probe.c` reproduces all of this. Build with
-`make tools`, run as root.
+### The fix: synthesize the parameter sets
+
+The encoder does not tell you its configuration, but it cannot hide it either:
+every slice header it writes is consistent with exactly one set of values.
+Parsing 30 consecutive slice headers pins them.
+
+| observation across 30 slices | forces |
+|---|---|
+| `frame_num` reads 0,1,2,… and resets at the IDR | `log2_max_frame_num = 12` |
+| `pic_order_cnt_lsb` steps by exactly 2 | `log2_max_pic_order_cnt_lsb = 12` |
+| `cabac_init_idc` present and valid | `entropy_coding_mode_flag = 1` |
+| `slice_qp_delta` ramps smoothly +4 → −8 | `pic_init_qp_minus26 = 0` |
+
+That last row is the one that tells you the bit alignment is genuinely right
+rather than accidentally plausible: a wrong offset produces noise, not a
+monotone rate-control curve.
+
+Three more fields fall out of decode testing, because any other value breaks
+CABAC context initialisation immediately at MB 0: `transform_8x8_mode_flag = 0`,
+`constrained_intra_pred_flag = 0`, `pic_init_qp_minus26 = 0`.
+
+`chroma_qp_index_offset` needs a different test, because a wrong value **decodes
+without any error** and only degrades chroma silently. Scoring PSNR against the
+probe's own deterministic source pattern settles it: `0` gives U 43.4 dB /
+V 44.2 dB, and every other value in −7…+7 collapses by 5 to 25 dB.
+
+For 1280×720 the result is:
+
+```
+SPS (11 bytes):  67 64 00 33 ac 13 12 e0 50 05 b9
+PPS (4 bytes):   68 ee 3c 80
+```
+
+Both match the lengths the avcC record declares **exactly** — the SPS is 87 bits
+plus the stop bit, filling 11 bytes with no padding. All 30 frames then decode
+with zero `ffmpeg` errors at ~46 dB PSNR against the source.
+
+Two honest caveats. `max_num_ref_frames` is **not** recoverable from the stream:
+it only ever uses one reference, so 1 and 2 decode identically. 2 is used as the
+safer DPB hint. And these values describe the encoder's *default* configuration
+— change profile, level, GOP or rate control and they must be re-derived. Take
+profile and level from the avcC record's header bytes, which are valid.
+
+`tools/cedar-h264-encode-probe.c` implements all of this: it detects the filler
+record, synthesizes the parameter sets (including frame cropping, so 1080p codes
+as 1088 with `frame_crop_bottom_offset = 4`), and writes a decodable Annex-B
+file. Build with `make tools`, run as root.
 
 ## Scope and caveats
 
