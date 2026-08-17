@@ -184,7 +184,9 @@ one.
 
 ## H.264 encoding: the hardware encoder works, and its output can be made to decode
 
-Three things trip people up here, and none of them is a hardware limitation.
+Four things trip people up here, and none of them is a hardware limitation.
+Number 4 is the one that produces the widely reported `wait interrupt
+overtime`, and it turns out to be an alignment rule rather than a defect.
 
 **1. The encoder device is root-only.** The decoder node is world-accessible,
 the encoder node is not:
@@ -203,14 +205,16 @@ VideoEncCreate: init ve ops failed
 ```
 
 That is a *different* failure from the reported "wait interrupt overtime" - it
-never reaches the interrupt path. Run as root, or add a udev rule:
+never reaches the interrupt path. For the failure that genuinely does produce
+that message, see item 4 below. Run as root, or add a udev rule:
 
 ```
 SUBSYSTEM=="misc", KERNEL=="cedar_dev_ve2", GROUP="video", MODE="0660"
 ```
 
 With the device reachable, encoding runs: 30 frames of 1280x720 encoded in one
-pass, 30 bitstream frames returned, 263 KB out.
+pass, 30 bitstream frames returned, 263 KB out. Sustained rates are in
+[Encoder throughput](#encoder-throughput) below.
 
 **2. The output is AVCC, not Annex-B.** Setting `bEncH264Nalu = 1` does not
 change this. A raw dump of the encoder output starts:
@@ -322,6 +326,84 @@ profile and level from the avcC record's header bytes, which are valid.
 record, synthesizes the parameter sets (including frame cropping, so 1080p codes
 as 1088 with `frame_crop_bottom_offset = 4`), and writes a decodable Annex-B
 file. Build with `make tools`, run as root.
+
+### 4. Encode height must be a multiple of 16
+
+This is what actually produces `h264 encoder wait interrupt overtime`, the error
+most often reported against this encoder. It is not a hardware limit, not a
+permissions problem, and not a fault in the interrupt path: the encoder never
+completes a frame whose height is not 16-aligned, and the driver then times out
+waiting for an interrupt that is never coming. It fails at frame 0, every time,
+in about a second.
+
+Sweep at default settings, 60 frames each:
+
+```
+1280x720    h%16=0   OK
+1920x720    h%16=0   OK
+1600x896    h%16=0   OK
+1920x1088   h%16=0   OK
+1280x1080   h%16=8   FAIL at frame 0
+1600x900    h%16=4   FAIL at frame 0
+1920x1080   h%16=8   FAIL at frame 0
+```
+
+Perfect correlation, no exceptions. Every width tested was already 16-aligned,
+so this documents the height constraint only.
+
+So 1080p encodes fine as **1920x1088** with the crop signalled in the SPS, which
+is the same padding the decode side already needs. Note that
+`tools/cedar-h264-encode-probe.c` passes `argv[2]` straight into
+`cfg.nInputHeight` and does not pad for you: call it with 1088, not 1080.
+
+### Encoder throughput
+
+Timed on an otherwise idle board against monotonic `/proc/uptime`, two frame
+counts per resolution so that encoder init cancels out of the marginal rate:
+
+| resolution | 60 frames | 360 frames | marginal | vs 30 fps | vs 60 fps |
+|---|---|---|---|---|---|
+| 1280x720  | 0.43 s | 1.91 s | **~203 fps** | 6.8x | 3.4x |
+| 1920x1088 | 0.75 s | 3.82 s | **~98 fps**  | 3.3x | 1.6x |
+
+Both figures are lower bounds on the encoder itself, because the probe also
+generates its synthetic source frame on the CPU inside the timed loop. The A76
+cluster stayed at 416 MHz under `ondemand` for the whole run (max 2002 MHz) and
+the VE ran at its default 624 MHz, so neither was boosted to get these numbers.
+
+Content is synthetic and the run is short, so this measures the fixed-function
+pipeline rather than long-run behaviour under real video. Encode has not been
+soak-tested; the one-hour soak in [Results](#results) was the decode path.
+
+### Rate control: the full set is available
+
+`VENC_RC_MODE` in `vencoder.h` is not QP-only:
+
+```c
+AW_CBR = 0    AW_VBR = 1    AW_AVBR = 2    AW_QPMAP = 3    AW_FIXQP = 4
+```
+
+with the surrounding controls you would want for streaming:
+
+| control | index / struct |
+|---|---|
+| target bitrate (bps)  | `VENC_IndexParamBitrate`, `nBitrate` |
+| ceiling and floor     | `VENC_IndexParamSetBitRateRange` -> `VencBitRateRange` |
+| VBV buffer            | `VENC_IndexParamSetVbvSize`, `VENC_IndexParamVbvInfo` |
+| keyframe interval     | `VENC_IndexParamMaxKeyInterval` |
+| on-demand IDR         | `VENC_IndexParamForceKeyFrame` |
+| QP bounds inside RC   | `VencQPRange` |
+| per-frame size cap    | `VENC_IndexParamSuperFrameConfig` |
+| overflow behaviour    | `VENC_IndexParamDropOverflowFrame`, `VENC_IndexParamFillingCbr` |
+
+H.265 is present too (`libvenc_h265.so`, `VENC_IndexParamH265Param`), untested
+here.
+
+The probe leaves all of these at their defaults, since `VencBaseConfig` is
+memset to zero, so the synthesized parameter sets above describe the *default*
+configuration only. `nBitrate` does not appear in the SPS or PPS, so changing it
+at runtime should not invalidate them, but that is an inference from where the
+field lives rather than something tested here.
 
 ## Scope and caveats
 
