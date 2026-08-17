@@ -209,7 +209,25 @@ never reaches the interrupt path. For the failure that genuinely does produce
 that message, see item 4 below. Run as root, or add a udev rule:
 
 ```
-SUBSYSTEM=="misc", KERNEL=="cedar_dev_ve2", GROUP="video", MODE="0660"
+SUBSYSTEM=="cedar_ve2", KERNEL=="cedar_dev_ve2", GROUP="video", MODE="0660"
+```
+
+The subsystem is `cedar_ve2`, **not** `misc`. The driver registers its own
+subsystem rather than sitting under `misc`, which is easy to assume and wrong:
+
+```
+P: /devices/virtual/cedar_ve2/cedar_dev_ve2
+E: SUBSYSTEM=cedar_ve2
+```
+
+A rule matching `SUBSYSTEM=="misc"` loads without error and never fires, so the
+node keeps its `crw------- root root` default and the only symptom is that
+`VideoEncCreate()` still fails as a normal user. Matching on `KERNEL` alone
+works too, since the name is unique. With the correct rule and membership of
+`video`:
+
+```
+crw-rw---- 1 root video 237, 0 /dev/cedar_dev_ve2
 ```
 
 With the device reachable, encoding runs: 30 frames of 1280x720 encoded in one
