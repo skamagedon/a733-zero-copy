@@ -7,6 +7,10 @@ the broken OMX wrapper and hands you a real `dma_buf` file descriptor per
 decoded frame, which imports straight into DRM/KMS. Same board, same clip:
 **174% CPU → ~8%, and no X server at all.**
 
+The same approach covers encoding: `cedarzcenc` reaches 52 fps at 1080p where
+`x264enc` manages 6.7, which is what makes real-time transcode and
+compositing possible on this board at all.
+
 Tested on an Orange Pi 4 Pro (A733), Orange Pi 1.0.6 Bullseye, vendor kernel
 `5.15.147-sun60iw2`. No kernel patches, no custom modules, no vendor SDK build.
 
@@ -565,6 +569,72 @@ Two implementation notes that may save you time if you write something similar:
   with exactly the sinks you want to feed. This element offers the feature,
   checks whether the peer accepts it, and falls back to plain caps — the
   buffers are `dma_buf`-backed either way, so nothing is copied.
+
+### 5. GStreamer element — `cedarzcenc`
+
+The encoder counterpart. The silicon always encoded fine, but nothing exposed
+it to GStreamer, so the only usable encoder on this board was `x264enc` at
+about 16 fps for 720p and 6.7 for 1080p. This element closes that gap.
+
+```sh
+make gst
+sudo make install-gst
+gst-inspect-1.0 cedarzcenc
+```
+
+```sh
+gst-launch-1.0 videotestsrc ! video/x-raw,format=NV12,width=1920,height=1080     ! cedarzcenc bitrate=3000 gop=60 ! h264parse ! flvmux ! rtmp2sink location=...
+```
+
+Measured on A733, 1920x1080 NV12:
+
+| encoder | rate at 1080p |
+| --- | --- |
+| `x264enc speed-preset=veryfast` | 6.7 fps |
+| `cedarzcenc` | **52.4 fps** |
+
+300 frames in 5.729 s, output `h264 High, 1920x1080, yuv420p`, decoding with
+zero `ffmpeg` errors, keyframe spacing exactly 60 frames at `gop=60`, and
+3.15 Mbps against `bitrate=3000`.
+
+End to end against a live camera, both directions in hardware:
+
+```sh
+gst-launch-1.0 rtspsrc location=rtsp://... ! rtph264depay ! h264parse     ! cedarzcdec ! videoconvert ! video/x-raw,format=NV12     ! cedarzcenc bitrate=2500 gop=40 ! h264parse ! ...
+```
+
+held realtime 1080p for ten minutes at the requested bitrate.
+
+The element hides all three encoder quirks documented above:
+
+- **16-alignment is invisible to callers.** Ask for 1080 and it encodes 1088
+  and emits the difference as SPS frame cropping, so the stream correctly
+  reports 1080. No caller ever has to think about `wait interrupt overtime`.
+- **AVCC is rewritten to Annex-B** on the way out.
+- **Parameter sets are synthesized and prepended ahead of every IDR**, since
+  they cannot be retrieved and there is no inline-emission option. That is also
+  exactly what a live RTMP or HLS consumer needs.
+
+Properties: `bitrate` (CBR kbps), `gop`, `qp-min`, `qp-max`. `bitrate` and
+`gop` are settable while the pipeline is running, because neither appears in
+the SPS or PPS and so changing them does not invalidate the synthesized
+parameter sets.
+
+Two things worth knowing if you modify it:
+
+- **`bEntropyCodingCABAC` must be 1.** `build_pps()` writes
+  `entropy_coding_mode_flag = 1`, and a PPS claiming CABAC over CAVLC slice
+  data does not decode at all. The two have to be changed together.
+- **`eRcMode` is not on `VencH264Param`.** It lives in the nested `sRcParam`,
+  as does the VBR configuration. Setting it on the outer struct silently does
+  nothing and you get the constant-quality default, which is wrong for a fixed
+  uplink.
+
+The input path is currently a `memcpy` into the encoder's own buffer, which is
+most of the distance between this element's 52 fps and the 98 fps the raw probe
+reaches at the same resolution. Importing DMA-BUFs instead would close it, and
+would also let `cedarzcdec` feed `cedarzcenc` without a round trip through
+system memory.
 
 ## Output pixel format: NV12, NV21, YV12 are all selectable
 
