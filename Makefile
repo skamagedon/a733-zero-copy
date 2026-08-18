@@ -45,17 +45,23 @@ probe:   $(BINDIR)/cedar-dmabuf-drm-probe
 present: $(BINDIR)/cedar-drm-present
 player:  $(BINDIR)/zc-playlist-player
 tools:   $(BINDIR)/drm-fence-caps-probe $(BINDIR)/drm-plane-reset $(BINDIR)/cedar-h264-encode-probe $(BINDIR)/cedar-sps-pps-diag
-gst:     $(BINDIR)/libgstcedarzc.so
+gst:     $(BINDIR)/libgstcedarzc.so $(BINDIR)/libgstcedarzcenc.so
 
 # Built as a shared object with -fPIC; GStreamer dlopen()s it from the
 # plugin directory.
 $(BINDIR)/libgstcedarzc.so: gst/gstcedarzcdec.c | $(BINDIR)
 	$(CC) $(CFLAGS) -fPIC -shared $(GST_CFLAGS) -o $@ $< $(CEDAR_LIBS) $(GST_LIBS)
 
-install-gst: $(BINDIR)/libgstcedarzc.so
+# Hardware H.264 encoder. Links libvencoder, not libvdecoder, and needs no
+# libdrm: it produces a byte-stream, not a surface.
+$(BINDIR)/libgstcedarzcenc.so: gst/gstcedarzcenc.c | $(BINDIR)
+	$(CC) $(CFLAGS) -fPIC -shared $(GST_CFLAGS) -o $@ $< 		-lvencoder -lMemAdapter -lVE -lcdc_base $(GST_LIBS)
+
+install-gst: $(BINDIR)/libgstcedarzc.so $(BINDIR)/libgstcedarzcenc.so
 	@test -n "$(GST_PLUGINDIR)" || { echo "cannot find the GStreamer plugin dir"; exit 1; }
-	install -m 0644 $< $(DESTDIR)$(GST_PLUGINDIR)/libgstcedarzc.so
-	@echo "installed; verify with: gst-inspect-1.0 cedarzcdec"
+	install -m 0644 $(BINDIR)/libgstcedarzc.so $(DESTDIR)$(GST_PLUGINDIR)/libgstcedarzc.so
+	install -m 0644 $(BINDIR)/libgstcedarzcenc.so $(DESTDIR)$(GST_PLUGINDIR)/libgstcedarzcenc.so
+	@echo "installed; verify with: gst-inspect-1.0 cedarzcdec cedarzcenc"
 
 $(BINDIR):
 	@mkdir -p $(BINDIR)
