@@ -87,6 +87,12 @@ struct _GstCedarZcEnc
   guint8 hdr[64];
   gsize hdr_len;
 
+  /* The encoder's bitstream buffer is circular, so a frame can come back as
+   * two segments. They are reassembled here before parsing. Grown on demand
+   * and kept for the life of the element rather than allocated per frame. */
+  guint8 *split;
+  gsize split_cap;
+
   guint bitrate;
   guint gop;
   guint qp_min;
@@ -389,6 +395,9 @@ gst_cedar_zc_enc_stop (GstVideoEncoder * encoder)
     gst_video_codec_state_unref (self->input_state);
     self->input_state = NULL;
   }
+  g_clear_pointer (&self->split, g_free);
+  self->split_cap = 0;
+
   GST_INFO_OBJECT (self, "stopped");
   return TRUE;
 }
@@ -645,15 +654,58 @@ gst_cedar_zc_enc_handle_frame (GstVideoEncoder * encoder,
   gst_buffer_map (outbuf, &map, GST_MAP_WRITE);
 
   o = self->hdr_len;            /* leave room; filled in once we know it is an IDR */
-  if (ob.nSize0 && ob.pData0) {
-    gboolean k = FALSE;
-    o += avcc_to_annexb (ob.pData0, ob.nSize0, map.data + o, &k);
-    idr |= k;
-  }
+
+  /* pData0 and pData1 are NOT two independent AVCC streams. The encoder's
+   * bitstream buffer is circular, and a frame whose data runs past the end
+   * continues at pData1, so the two segments are one contiguous byte stream
+   * split at an arbitrary offset that has nothing to do with NAL boundaries.
+   *
+   * Converting each segment separately corrupts the output three ways: a
+   * length prefix straddling the split is misread from both halves; a NAL
+   * whose payload crosses the end of segment 0 fails the `off + n > len`
+   * bounds check and silently drops the rest of that segment; and segment 1
+   * is then parsed as though its first four bytes were a length prefix when
+   * they are mid-payload. The result decodes as CABAC desync, reported as
+   * "error while decoding MB 0 0" and "cabac decode of qscale diff failed".
+   *
+   * This was missed originally because a short run into a fresh output buffer
+   * does not wrap: nSize1 is zero, the single-segment path is taken, and the
+   * parameter sets validate correctly. It only appears once the buffer has
+   * been round the ring, which is to say in any real use.
+   *
+   * So: join first, parse once. The extra copy costs one frame of memcpy and
+   * removes the boundary case entirely.
+   */
   if (ob.nSize1 && ob.pData1) {
-    gboolean k = FALSE;
-    o += avcc_to_annexb (ob.pData1, ob.nSize1, map.data + o, &k);
-    idr |= k;
+    gsize need = (gsize) ob.nSize0 + (gsize) ob.nSize1;
+
+    /* Logged because whether this path is ever taken is the whole question.
+     * On the board this was developed on it never fired in a 90 frame run,
+     * so the joining below is currently unproven in practice. If you are
+     * debugging a corrupt bitstream, the presence or absence of this line
+     * tells you immediately whether the wrap is involved. */
+    GST_DEBUG_OBJECT (self,
+        "bitstream wrapped the ring buffer: %u + %u bytes, joining",
+        ob.nSize0, ob.nSize1);
+
+    if (need > self->split_cap) {
+      guint8 *grown = g_realloc (self->split, need);
+      if (!grown) {
+        gst_buffer_unmap (outbuf, &map);
+        gst_buffer_unref (outbuf);
+        FreeOneBitStreamFrame (self->enc, &ob);
+        gst_video_codec_frame_unref (frame);
+        return GST_FLOW_ERROR;
+      }
+      self->split = grown;
+      self->split_cap = need;
+    }
+    if (ob.nSize0 && ob.pData0)
+      memcpy (self->split, ob.pData0, ob.nSize0);
+    memcpy (self->split + ob.nSize0, ob.pData1, ob.nSize1);
+    o += avcc_to_annexb (self->split, need, map.data + o, &idr);
+  } else if (ob.nSize0 && ob.pData0) {
+    o += avcc_to_annexb (ob.pData0, ob.nSize0, map.data + o, &idr);
   }
 
   if (idr && self->hdr_len) {
