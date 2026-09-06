@@ -695,3 +695,11 @@ not covered by it and are not included; they come with your board's image.
 - Allwinner's public (older-generation) OMX/CedarX source, useful for
   understanding the shape of the API but **not** for its values:
   <https://github.com/allwinner-zh/media-codec>
+
+## Operating contract
+
+This box is part of the Tiki Productions rack estate. The access paths,
+hardware findings and rules that apply across all of it live in
+[project-law](https://github.com/skamagedon/project-law). **Read it first.**
+It is the record of what was already learned the hard way, and answers that
+sit in it have been rediscovered slowly more than once.
