@@ -41,6 +41,9 @@
 #include <gst/video/gstvideoencoder.h>
 
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
 
 #include "vencoder.h"
 #include "memoryAdapter.h"
@@ -224,6 +227,15 @@ build_pps (struct bw *s)
   bw_u (s, 1, 1);               /* deblocking_filter_control_present */
   bw_u (s, 1, 0);               /* constrained_intra_pred_flag */
   bw_u (s, 1, 0);               /* redundant_pic_cnt_present_flag */
+  /* High-profile trailing fields. Omitting them makes transform_8x8_mode_flag
+   * default to 0, and the encoder DOES use the 8x8 transform once its High
+   * profile configuration actually reaches it. A PPS that denies 8x8 while the
+   * slices use it desynchronises CABAC at the very first macroblock, which
+   * decodes as "top block unavailable for requested intra mode" and
+   * "error while decoding MB 0 0". */
+  bw_u (s, 1, 1);               /* transform_8x8_mode_flag */
+  bw_u (s, 1, 0);               /* pic_scaling_matrix_present_flag */
+  bw_se (s, 0);                 /* second_chroma_qp_index_offset */
   return bw_finish (s);
 }
 
@@ -432,6 +444,23 @@ gst_cedar_zc_enc_set_format (GstVideoEncoder * encoder,
         "and cropping %d lines in the SPS", self->height, self->enc_height,
         self->enc_height - self->height);
 
+  /* Check the device before handing control to the vendor library. It
+   * returns a non-NULL encoder even when /dev/cedar_dev_ve2 cannot be opened,
+   * and then segfaults inside VideoEncInit, so the guard below never fires and
+   * the user gets a crash instead of the explanation. */
+  {
+    int probe = open ("/dev/cedar_dev_ve2", O_RDWR);
+    if (probe < 0) {
+      GST_ELEMENT_ERROR (self, RESOURCE, OPEN_READ_WRITE,
+          ("cannot open /dev/cedar_dev_ve2: %s", g_strerror (errno)),
+          ("It is root-only by default. Install the udev rule "
+              "KERNEL==\"cedar_dev_ve2\", GROUP=\"video\", MODE=\"0660\" "
+              "and join the video group."));
+      return FALSE;
+    }
+    close (probe);
+  }
+
   self->enc = VideoEncCreate (VENC_CODEC_H264);
   if (!self->enc) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_READ_WRITE,
@@ -454,15 +483,21 @@ gst_cedar_zc_enc_set_format (GstVideoEncoder * encoder,
   cfg.pVeOpsSelf = NULL;
   cfg.bEncH264Nalu = 1;         /* does not actually give Annex-B; see quirk 2 */
 
-  if (VideoEncInit (self->enc, &cfg) != 0) {
-    GST_ELEMENT_ERROR (self, LIBRARY, INIT, ("VideoEncInit failed"),
-        ("%dx%d (encode height %d)", self->width, self->height,
-            self->enc_height));
-    teardown_encoder (self);
-    return FALSE;
-  }
-
-  /* Rate control. The A733 exposes the full set - CBR, VBR, AVBR, QPMAP,
+  /* Rate control. Set BEFORE VideoEncInit, which is the part that matters:
+   * VideoEncSetParameter after init is accepted and then silently discarded,
+   * so the encoder runs its defaults and the bitrate property does nothing.
+   * Measured on an A733: 60 frames of 1080p asking for 4000 kbps produced
+   * 1650345 bytes, about 6.6 Mbps, with the call after init; the same request
+   * with the call before init produced 999741 bytes, which is 4000 kbps.
+   *
+   * This is also why the synthesized parameter sets used to be wrong. They
+   * were derived from an encoder running its defaults, because the requested
+   * configuration was never reaching it. Some libcedarc builds DO honour the
+   * late call, and on those boards the encoder used the High profile settings
+   * while the parameter sets still described the defaults, which is what made
+   * the output undecodable there and fine here.
+   *
+   * Rate control. The A733 exposes the full set - CBR, VBR, AVBR, QPMAP,
    * FixQP - so we drive real CBR rather than constant quality, which is what
    * a fixed-bitrate uplink needs. */
   memset (&h264, 0, sizeof (h264));
@@ -487,6 +522,15 @@ gst_cedar_zc_enc_set_format (GstVideoEncoder * encoder,
   h264.sRcParam.eRcMode = AW_CBR;
   if (VideoEncSetParameter (self->enc, VENC_IndexParamH264Param, &h264) != 0)
     GST_WARNING_OBJECT (self, "VENC_IndexParamH264Param was rejected");
+
+  if (VideoEncInit (self->enc, &cfg) != 0) {
+    GST_ELEMENT_ERROR (self, LIBRARY, INIT, ("VideoEncInit failed"),
+        ("%dx%d (encode height %d)", self->width, self->height,
+            self->enc_height));
+    teardown_encoder (self);
+    return FALSE;
+  }
+
 
   memset (&bufparam, 0, sizeof (bufparam));
   bufparam.nBufferNum = 4;
