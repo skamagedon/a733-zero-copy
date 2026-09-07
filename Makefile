@@ -107,3 +107,13 @@ check:
 
 clean:
 	rm -rf $(BINDIR)
+
+# The encoder device is root-only on the stock image, and the resulting failure
+# is a segfault inside the vendor library rather than a permission error.
+install-udev:
+	install -m 0644 udev/99-cedar-ve2.rules /etc/udev/rules.d/99-cedar-ve2.rules
+	udevadm control --reload-rules
+	udevadm trigger --sysname-match=cedar_dev_ve2
+	@echo "add yourself to the video group if you are not already: sudo usermod -aG video \$$USER"
+
+.PHONY: install-udev

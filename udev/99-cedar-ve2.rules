@@ -1,0 +1,27 @@
+# Allwinner A733 hardware H.264 encoder.
+#
+# The stock image leaves /dev/cedar_dev_ve2 as 0600 root:root, so any non-root
+# GStreamer pipeline using cedarzcenc fails. The decoder at /dev/cedar_dev is
+# already world-accessible; only the encoder needs this.
+#
+# THE SUBSYSTEM IS cedar_ve2, NOT misc. The driver registers its own subsystem,
+# which is easy to assume wrongly and produces a rule that silently matches
+# nothing:
+#
+#   P: /devices/virtual/cedar_ve2/cedar_dev_ve2
+#   E: SUBSYSTEM=cedar_ve2
+#
+# Install:
+#   sudo cp udev/99-cedar-ve2.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --sysname-match=cedar_dev_ve2
+#   sudo usermod -aG video "$USER"      # then log out and back in
+#
+# Verify, as the login user rather than as root:
+#   python3 -c "import os; os.close(os.open('/dev/cedar_dev_ve2', os.O_RDWR))"
+#
+# Without this the failure is not a clean permission error. VideoEncCreate()
+# returns a non-NULL encoder even when the device cannot be opened, and the
+# vendor library then segfaults inside VideoEncInit. gstcedarzcenc.c probes the
+# device up front for exactly that reason, so it can say what is wrong.
+SUBSYSTEM=="cedar_ve2", KERNEL=="cedar_dev_ve2", GROUP="video", MODE="0660"
