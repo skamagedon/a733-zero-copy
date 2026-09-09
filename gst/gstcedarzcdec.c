@@ -55,6 +55,20 @@ extern VeOpsS *GetVeOpsS (int type);
 GST_DEBUG_CATEGORY_STATIC (cedarzcdec_debug);
 #define GST_CAT_DEFAULT cedarzcdec_debug
 
+/* How long to wait for room in the Cedar stream buffer before giving up on
+ * an access unit.
+ *
+ * Waiting here IS the backpressure. handle_frame runs on the streaming
+ * thread, so blocking in it is what tells upstream to slow down, which is
+ * the whole mechanism a pull-rate source like filesrc relies on to not
+ * outrun a hardware decoder.
+ *
+ * Bounded rather than indefinite so that a genuinely wedged decoder fails
+ * as a stuttering stream instead of a hung pipeline. A second is far longer
+ * than any legitimate decode and short enough that a live source recovers.
+ */
+#define SUBMIT_WAIT_US (1 * G_USEC_PER_SEC)
+
 #define GST_TYPE_CEDAR_ZC_DEC (gst_cedar_zc_dec_get_type ())
 G_DECLARE_FINAL_TYPE (GstCedarZcDec, gst_cedar_zc_dec, GST, CEDAR_ZC_DEC,
     GstVideoDecoder)
@@ -76,6 +90,12 @@ struct _GstCedarZcDec
 
   gboolean configured;
   gint width, height;           /* display size, after crop */
+
+  /* Access units that could not be placed even after waiting. Counted
+   * rather than merely logged, because losing one silently is how a
+   * stream ends up decoding a fraction of its frames while every element
+   * in the pipeline reports success. */
+  guint64 dropped_aus;
 
   /* Output format chosen at set_format time and confirmed against what the
    * decoder actually delivers. Cedar honours the request for NV12, NV21 and
@@ -234,6 +254,12 @@ gst_cedar_zc_dec_stop (GstVideoDecoder * decoder)
 {
   GstCedarZcDec *self = GST_CEDAR_ZC_DEC (decoder);
 
+  if (self->dropped_aus)
+    GST_ELEMENT_WARNING (self, STREAM, DECODE, (NULL),
+        ("%" G_GUINT64_FORMAT " access unit(s) were dropped for want of room "
+            "in the stream buffer; the decoded output is incomplete",
+            self->dropped_aus));
+
   g_mutex_lock (&self->lock);
   self->shutting_down = TRUE;
   if (self->outstanding > 0) {
@@ -306,6 +332,25 @@ gst_cedar_zc_dec_set_format (GstVideoDecoder * decoder,
   vc.nFrameBufferNum = 8;
   vc.bDispErrorFrame = 1;
   vc.nDisplayHoldingFrameBufferNum = 2;
+  /* Slack for the decoder to work ahead in. Leaving this at zero deadlocks
+   * the decoder outright on some perfectly ordinary streams: it decodes about
+   * a dozen frames, then every DecodeVideoStream returns NO_FRAME_BUFFER
+   * forever, whatever is downstream and however large nFrameBufferNum is.
+   *
+   * Measured on Big_Buck_Bunny_1080_10s_30MB.mp4, decoder straight to
+   * fakesink so nothing held a surface:
+   *
+   *   nDecodeSmoothFrameBufferNum = 0    13 frames decoded, 744 NO_FRAME_BUFFER
+   *   nDecodeSmoothFrameBufferNum = 3   283 frames decoded,   0 NO_FRAME_BUFFER
+   *
+   * Raising nFrameBufferNum does nothing for it; 4, 8, 16, 24 and 32 all stall
+   * at the same 13 frames. It is this field specifically, and the vendor
+   * library says so on every single init:
+   *
+   *   warning: the nDecodeSmoothFrameBufferNum is 0
+   *
+   * which is worth reading as an error rather than noise. */
+  vc.nDecodeSmoothFrameBufferNum = 3;
 
   if (InitializeVideoDecoder (self->dec, &si, &vc) != 0) {
     DestroyVideoDecoder (self->dec);
@@ -462,6 +507,97 @@ wrap_picture (GstCedarZcDec * self, VideoPicture * pic)
   return buf;
 }
 
+static void
+return_picture (GstCedarZcDec * self, VideoPicture * pic)
+{
+  g_mutex_lock (&self->lock);
+  if (self->dec)
+    ReturnPicture (self->dec, pic);
+  g_mutex_unlock (&self->lock);
+}
+
+/* Hand one decoded picture downstream, matched to the OLDEST frame still
+ * waiting for output.
+ *
+ * The oldest frame is the right one; the frame currently going in is not. A
+ * hardware decoder runs several frames behind its input, so the picture that
+ * emerges while access unit N is submitted belongs to an earlier access unit.
+ * Attaching it to N stamped every buffer a few frames late, and, worse,
+ * gst_video_decoder_finish_frame() releases every frame OLDER than the one it
+ * is handed. So each output quietly discarded the frames the decoder was still
+ * working on, and the shortfall grew with the decoder's own latency. That is
+ * where the missing frames went: 577 of 600 on one clip, 270 of 300 on
+ * another, with nothing anywhere reporting a loss. */
+static GstFlowReturn
+emit_picture (GstCedarZcDec * self, GstVideoDecoder * decoder,
+    VideoPicture * pic)
+{
+  GstVideoCodecFrame *out;
+  GstBuffer *buf;
+
+  if (pic->bEnableAfbcFlag) {
+    GST_ELEMENT_ERROR (self, STREAM, DECODE, (NULL),
+        ("decoder produced an AFBC-compressed surface, which needs a DRM "
+            "modifier this element does not negotiate"));
+    return_picture (self, pic);
+    return GST_FLOW_ERROR;
+  }
+
+  if (!self->configured && !configure_output (self, pic)) {
+    return_picture (self, pic);
+    return GST_FLOW_NOT_NEGOTIATED;
+  }
+
+  buf = wrap_picture (self, pic);
+  if (!buf) {
+    return_picture (self, pic);
+    return GST_FLOW_ERROR;
+  }
+
+  out = gst_video_decoder_get_oldest_frame (decoder);
+  if (!out) {
+    /* Nothing pending to carry it. Push it rather than drop it. */
+    return gst_pad_push (GST_VIDEO_DECODER_SRC_PAD (decoder), buf);
+  }
+
+  out->output_buffer = buf;
+  return gst_video_decoder_finish_frame (decoder, out);
+}
+
+/* Pull out everything still inside the decoder at end of stream.
+ *
+ * There was no drain at all before, so the pictures the decoder was holding
+ * when the input ran out were simply lost. On a ten second clip that is a
+ * visible piece of the ending, not a rounding error. */
+static GstFlowReturn
+gst_cedar_zc_dec_finish (GstVideoDecoder * decoder)
+{
+  GstCedarZcDec *self = GST_CEDAR_ZC_DEC (decoder);
+  GstFlowReturn ret = GST_FLOW_OK;
+  int empty = 0;
+
+  while (empty < 8 && ret == GST_FLOW_OK) {
+    VideoPicture *pic = NULL;
+
+    g_mutex_lock (&self->lock);
+    if (self->dec) {
+      DecodeVideoStream (self->dec, 1 /* end of stream */, 0, 0, 0);
+      pic = RequestPicture (self->dec, 0);
+    }
+    g_mutex_unlock (&self->lock);
+
+    if (!pic) {
+      empty++;
+      continue;
+    }
+    empty = 0;
+    ret = emit_picture (self, decoder, pic);
+  }
+
+  GST_INFO_OBJECT (self, "drained at end of stream");
+  return ret;
+}
+
 static GstFlowReturn
 gst_cedar_zc_dec_handle_frame (GstVideoDecoder * decoder,
     GstVideoCodecFrame * frame)
@@ -472,6 +608,8 @@ gst_cedar_zc_dec_handle_frame (GstVideoDecoder * decoder,
   char *buf = NULL, *ring = NULL;
   int bufsz = 0, ringsz = 0;
   int rounds = 0;
+  gboolean submitted = FALSE;
+  gint64 deadline;
 
   if (!gst_buffer_map (frame->input_buffer, &map, GST_MAP_READ)) {
     gst_video_codec_frame_unref (frame);
@@ -486,28 +624,63 @@ gst_cedar_zc_dec_handle_frame (GstVideoDecoder * decoder,
     return GST_FLOW_FLUSHING;
   }
 
-  if (RequestVideoStreamBuffer (self->dec, (int) map.size, &buf, &bufsz,
-          &ring, &ringsz, 0) == 0 && buf
-      && (gsize) (bufsz + ringsz) >= map.size) {
-    VideoStreamDataInfo di;
+  /* Get this access unit into the stream buffer, waiting for room rather than
+   * throwing it away.
+   *
+   * This used to drop on a full buffer and return GST_FLOW_OK, which is a
+   * silent, unbounded loss of coded data: the pipeline reports success, every
+   * element's stats look healthy, and the stream quietly decodes a fraction of
+   * its frames because the dropped units carried references the rest depended
+   * on. It never showed up on a live camera, where data arrives at the rate it
+   * was captured, and it is immediate on anything that reads as fast as the
+   * disk will go.
+   *
+   * Decoding is what empties the buffer, so decode; and surfaces come back
+   * from downstream on another thread, so also leave the lock long enough for
+   * that to happen. */
+  deadline = g_get_monotonic_time () + SUBMIT_WAIT_US;
+  for (;;) {
+    if (RequestVideoStreamBuffer (self->dec, (int) map.size, &buf, &bufsz,
+            &ring, &ringsz, 0) == 0 && buf
+        && (gsize) (bufsz + ringsz) >= map.size) {
+      VideoStreamDataInfo di;
 
-    /* The stream buffer is a ring; a request may straddle its wrap point. */
-    memcpy (buf, map.data, (gsize) bufsz);
-    if (ringsz > 0 && map.size > (gsize) bufsz)
-      memcpy (ring, map.data + bufsz, map.size - bufsz);
+      /* The stream buffer is a ring; a request may straddle its wrap point. */
+      memcpy (buf, map.data, (gsize) bufsz);
+      if (ringsz > 0 && map.size > (gsize) bufsz)
+        memcpy (ring, map.data + bufsz, map.size - bufsz);
 
-    memset (&di, 0, sizeof (di));
-    di.pData = buf;
-    di.nLength = (int) map.size;
-    di.bIsFirstPart = 1;
-    di.bIsLastPart = 1;
-    di.nPts = GST_CLOCK_TIME_IS_VALID (frame->pts) ?
-        (int64_t) (frame->pts / GST_USECOND) : -1;
-    di.bValid = 1;
-    SubmitVideoStreamData (self->dec, &di, 0);
-  } else {
-    GST_WARNING_OBJECT (self, "no room in the Cedar stream buffer; dropping");
+      memset (&di, 0, sizeof (di));
+      di.pData = buf;
+      di.nLength = (int) map.size;
+      di.bIsFirstPart = 1;
+      di.bIsLastPart = 1;
+      di.nPts = GST_CLOCK_TIME_IS_VALID (frame->pts) ?
+          (int64_t) (frame->pts / GST_USECOND) : -1;
+      di.bValid = 1;
+      SubmitVideoStreamData (self->dec, &di, 0);
+      submitted = TRUE;
+      break;
+    }
+
+    DecodeVideoStream (self->dec, 0, 0, 0, 0);
+
+    if (g_get_monotonic_time () >= deadline)
+      break;
+
+    g_mutex_unlock (&self->lock);
+    g_usleep (1000);
+    g_mutex_lock (&self->lock);
+    if (!self->dec) {
+      g_mutex_unlock (&self->lock);
+      gst_buffer_unmap (frame->input_buffer, &map);
+      gst_video_codec_frame_unref (frame);
+      return GST_FLOW_FLUSHING;
+    }
   }
+
+  if (!submitted)
+    self->dropped_aus++;
 
   /* Decode is not guaranteed to yield a picture for every access unit, so
    * give it a bounded number of turns before returning empty-handed. */
@@ -519,44 +692,32 @@ gst_cedar_zc_dec_handle_frame (GstVideoDecoder * decoder,
 
   gst_buffer_unmap (frame->input_buffer, &map);
 
-  if (!pic) {
-    /* Reordering or startup latency: nothing to emit yet. */
-    gst_video_codec_frame_unref (frame);
-    return GST_FLOW_OK;
+  if (!submitted) {
+    /* On the bus for the first one, so it is visible without anybody having
+     * thought to set GST_DEBUG beforehand. That it was only ever a
+     * GST_WARNING is why this went unnoticed: at gst-launch's default debug
+     * level the message does not print at all, so the failure looked like
+     * nothing more than a short output file. */
+    if (self->dropped_aus == 1)
+      GST_ELEMENT_WARNING (self, STREAM, DECODE, (NULL),
+          ("no room in the Cedar stream buffer after waiting %d ms; "
+              "dropping coded data, so the output will be missing frames. "
+              "The stream is arriving faster than this decoder can consume "
+              "it and something upstream is not honouring backpressure.",
+              (int) (SUBMIT_WAIT_US / 1000)));
+    else
+      GST_WARNING_OBJECT (self, "dropped access unit (%" G_GUINT64_FORMAT
+          " so far)", self->dropped_aus);
   }
 
-  if (pic->bEnableAfbcFlag) {
-    GST_ELEMENT_ERROR (self, STREAM, DECODE, (NULL),
-        ("decoder produced an AFBC-compressed surface, which needs a DRM "
-            "modifier this element does not negotiate"));
-    g_mutex_lock (&self->lock);
-    if (self->dec)
-      ReturnPicture (self->dec, pic);
-    g_mutex_unlock (&self->lock);
-    gst_video_codec_frame_unref (frame);
-    return GST_FLOW_ERROR;
-  }
+  /* This frame's ref is done with. Any picture the decoder produces is matched
+   * to the oldest pending frame inside emit_picture, not to this one. */
+  gst_video_codec_frame_unref (frame);
 
-  if (!self->configured && !configure_output (self, pic)) {
-    g_mutex_lock (&self->lock);
-    if (self->dec)
-      ReturnPicture (self->dec, pic);
-    g_mutex_unlock (&self->lock);
-    gst_video_codec_frame_unref (frame);
-    return GST_FLOW_NOT_NEGOTIATED;
-  }
+  if (!pic)
+    return GST_FLOW_OK;         /* reordering or startup latency */
 
-  frame->output_buffer = wrap_picture (self, pic);
-  if (!frame->output_buffer) {
-    g_mutex_lock (&self->lock);
-    if (self->dec)
-      ReturnPicture (self->dec, pic);
-    g_mutex_unlock (&self->lock);
-    gst_video_codec_frame_unref (frame);
-    return GST_FLOW_ERROR;
-  }
-
-  return gst_video_decoder_finish_frame (decoder, frame);
+  return emit_picture (self, decoder, pic);
 }
 
 static gboolean
@@ -612,6 +773,7 @@ gst_cedar_zc_dec_class_init (GstCedarZcDecClass * klass)
   dec_class->set_format = gst_cedar_zc_dec_set_format;
   dec_class->handle_frame = gst_cedar_zc_dec_handle_frame;
   dec_class->flush = gst_cedar_zc_dec_flush;
+  dec_class->finish = gst_cedar_zc_dec_finish;
 }
 
 static gboolean
